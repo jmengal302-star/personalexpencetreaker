@@ -1,30 +1,31 @@
 """Personal Expense Tracker.
 
-Stack: Python + Reflex (UI) + Firebase Firestore (database) + Gemini (AI).
+Stack: Python + Streamlit (UI) + Firebase Firestore (database) + Gemini (AI).
 
 Features
 - Add / edit / delete expenses (stored in Firestore)
-- Filter by category, live totals per category
-- "Smart add": type "Lunch 450 yesterday" and Gemini fills the form for you
+- Filter by category, totals and a per-category chart
+- "Smart add": type "Lunch 450 yesterday" and Gemini pre-fills the form
 - "AI insights": Gemini summarises your spending and suggests savings
+- Optional password gate (set APP_PASSWORD in secrets)
 """
 
+import hmac
 import json
 import os
 from datetime import date
-from functools import lru_cache
 
 import firebase_admin
-import reflex as rx
-from dotenv import load_dotenv
+import pandas as pd
+import streamlit as st
 from firebase_admin import credentials, firestore
 from google import genai
 from google.genai import types
 
-load_dotenv()
+st.set_page_config(page_title="Expense Tracker", page_icon="💸", layout="wide")
 
 # --------------------------------------------------------------------------- #
-# Configuration
+# Configuration (Streamlit secrets first, environment variables as fallback)
 # --------------------------------------------------------------------------- #
 CATEGORIES = [
     "Food",
@@ -37,36 +38,76 @@ CATEGORIES = [
     "Other",
 ]
 COLLECTION = "expenses"
-CURRENCY = os.getenv("CURRENCY", "PKR")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+
+def _secret(key: str, default=None):
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:  # no secrets file available
+        pass
+    return os.getenv(key, default)
+
+
+CURRENCY = str(_secret("CURRENCY", "PKR"))
+GEMINI_MODEL = str(_secret("GEMINI_MODEL", "gemini-2.5-flash"))
+
+
+# --------------------------------------------------------------------------- #
+# Optional password gate
+# --------------------------------------------------------------------------- #
+def require_password() -> None:
+    password = _secret("APP_PASSWORD")
+    if not password or st.session_state.get("authed"):
+        return
+    st.title("💸 Expense Tracker")
+    entered = st.text_input("Password", type="password")
+    if entered:
+        if hmac.compare_digest(entered, str(password)):
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.error("Wrong password.")
+    st.stop()
 
 
 # --------------------------------------------------------------------------- #
 # Firebase (Firestore) data layer
 # --------------------------------------------------------------------------- #
-@lru_cache(maxsize=1)
+@st.cache_resource
 def get_db():
     """Initialise Firebase once and return the Firestore client."""
-    key_path = os.getenv("FIREBASE_CREDENTIALS", "serviceAccountKey.json")
     try:
         firebase_admin.get_app()
     except ValueError:
-        firebase_admin.initialize_app(credentials.Certificate(key_path))
+        info = _secret("firebase")
+        if info:
+            cred = credentials.Certificate(dict(info))
+        else:
+            cred = credentials.Certificate(
+                _secret("FIREBASE_CREDENTIALS", "serviceAccountKey.json")
+            )
+        firebase_admin.initialize_app(cred)
     return firestore.client()
 
 
-def fetch_expenses() -> list[dict[str, str]]:
-    """Return all expenses, newest first. Every value is a string for the UI."""
-    rows: list[dict[str, str]] = []
+@st.cache_data(ttl=300, show_spinner="Loading expenses...")
+def load_expenses() -> list[dict]:
+    """Return all expenses, newest first."""
+    rows = []
     for doc in get_db().collection(COLLECTION).stream():
         data = doc.to_dict() or {}
+        try:
+            when = date.fromisoformat(str(data.get("date")))
+        except ValueError:
+            when = date.today()
         rows.append(
             {
                 "id": doc.id,
                 "title": str(data.get("title", "")),
-                "amount": f"{float(data.get('amount', 0)):.2f}",
+                "amount": float(data.get("amount", 0)),
                 "category": str(data.get("category", "Other")),
-                "date": str(data.get("date", "")),
+                "date": when,
                 "note": str(data.get("note", "")),
             }
         )
@@ -74,30 +115,30 @@ def fetch_expenses() -> list[dict[str, str]]:
     return rows
 
 
-def create_expense(payload: dict) -> None:
-    get_db().collection(COLLECTION).add(
-        {**payload, "created_at": firestore.SERVER_TIMESTAMP}
-    )
-
-
-def update_expense(expense_id: str, payload: dict) -> None:
-    get_db().collection(COLLECTION).document(expense_id).update(
-        {**payload, "updated_at": firestore.SERVER_TIMESTAMP}
-    )
+def save_expense(expense_id: str | None, payload: dict) -> None:
+    col = get_db().collection(COLLECTION)
+    if expense_id:
+        col.document(expense_id).update(
+            {**payload, "updated_at": firestore.SERVER_TIMESTAMP}
+        )
+    else:
+        col.add({**payload, "created_at": firestore.SERVER_TIMESTAMP})
+    load_expenses.clear()
 
 
 def remove_expense(expense_id: str) -> None:
     get_db().collection(COLLECTION).document(expense_id).delete()
+    load_expenses.clear()
 
 
 # --------------------------------------------------------------------------- #
 # Gemini AI layer
 # --------------------------------------------------------------------------- #
 def _gemini_client() -> genai.Client:
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = _secret("GEMINI_API_KEY")
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set in your .env file.")
-    return genai.Client(api_key=api_key)
+        raise RuntimeError("GEMINI_API_KEY is not set in your secrets.")
+    return genai.Client(api_key=str(api_key))
 
 
 def parse_expense_with_gemini(text: str) -> dict:
@@ -119,15 +160,29 @@ Text: {text}"""
     data = json.loads(response.text)
     if isinstance(data, list):
         data = data[0]
-    if data.get("category") not in CATEGORIES:
-        data["category"] = "Other"
-    return data
+
+    try:
+        amount = float(data.get("amount", 0))
+    except (TypeError, ValueError):
+        amount = 0.0
+    try:
+        when = date.fromisoformat(str(data.get("date")))
+    except ValueError:
+        when = date.today()
+    category = data.get("category")
+    return {
+        "title": str(data.get("title", "")),
+        "amount": amount,
+        "category": category if category in CATEGORIES else "Other",
+        "date": when,
+        "note": str(data.get("note", "")),
+    }
 
 
-def generate_spending_insights(expenses: list[dict[str, str]]) -> str:
+def generate_spending_insights(expenses: list[dict]) -> str:
     """Ask Gemini for a short analysis of the user's spending."""
     lines = "\n".join(
-        f"{e['date']} | {e['title']} | {e['amount']} {CURRENCY} | {e['category']}"
+        f"{e['date']} | {e['title']} | {e['amount']:.2f} {CURRENCY} | {e['category']}"
         for e in expenses[:200]
     )
     prompt = f"""You are a concise personal-finance assistant.
@@ -148,420 +203,181 @@ Use short markdown bullets and only the data provided. Do not invent numbers.
 
 
 # --------------------------------------------------------------------------- #
-# State
+# Dialogs: add / edit / delete
 # --------------------------------------------------------------------------- #
-class State(rx.State):
-    # Data
-    expenses: list[dict[str, str]] = []
-    loading: bool = False
-    filter_category: str = "All"
+@st.dialog("Expense")
+def expense_dialog(expense: dict | None = None) -> None:
+    e = expense or {}
+    category = e.get("category", CATEGORIES[0])
 
-    # Add / edit form
-    show_form: bool = False
-    editing_id: str = ""
-    form_title: str = ""
-    form_amount: str = ""
-    form_category: str = CATEGORIES[0]
-    form_date: str = ""
-    form_note: str = ""
-
-    # AI
-    smart_text: str = ""
-    ai_loading: bool = False
-    insights: str = ""
-
-    # ---- generic setter (avoids one setter per field) ---------------------- #
-    def set_field(self, field: str, value: str):
-        setattr(self, field, value)
-
-    def toggle_form(self, is_open: bool):
-        self.show_form = is_open
-
-    # ---- computed values --------------------------------------------------- #
-    @rx.var
-    def visible_expenses(self) -> list[dict[str, str]]:
-        if self.filter_category == "All":
-            return self.expenses
-        return [e for e in self.expenses if e["category"] == self.filter_category]
-
-    @rx.var
-    def total_spent(self) -> str:
-        total = sum(float(e["amount"]) for e in self.visible_expenses)
-        return f"{total:,.2f}"
-
-    @rx.var
-    def category_totals(self) -> list[dict[str, str]]:
-        totals: dict[str, float] = {}
-        for e in self.expenses:
-            totals[e["category"]] = totals.get(e["category"], 0) + float(e["amount"])
-        ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
-        return [{"category": c, "amount": f"{a:,.2f}"} for c, a in ranked]
-
-    # ---- read -------------------------------------------------------------- #
-    def load_expenses(self):
-        self.loading = True
-        yield
-        try:
-            self.expenses = fetch_expenses()
-        except Exception as exc:  # noqa: BLE001
-            yield rx.toast.error(f"Could not load expenses: {exc}")
-        finally:
-            self.loading = False
-
-    # ---- create / update --------------------------------------------------- #
-    def _reset_form(self):
-        self.editing_id = ""
-        self.form_title = ""
-        self.form_amount = ""
-        self.form_category = CATEGORIES[0]
-        self.form_date = date.today().isoformat()
-        self.form_note = ""
-
-    def open_add(self):
-        self._reset_form()
-        self.show_form = True
-
-    def open_edit(self, expense_id: str):
-        expense = next((e for e in self.expenses if e["id"] == expense_id), None)
-        if expense is None:
-            return rx.toast.error("Expense not found.")
-        self.editing_id = expense_id
-        self.form_title = expense["title"]
-        self.form_amount = expense["amount"]
-        self.form_category = expense["category"]
-        self.form_date = expense["date"]
-        self.form_note = expense["note"]
-        self.show_form = True
-
-    def save_expense(self):
-        title = self.form_title.strip()
-        if not title:
-            return rx.toast.error("Please enter a title.")
-        try:
-            amount = float(self.form_amount)
-        except ValueError:
-            return rx.toast.error("Amount must be a number.")
-        if amount <= 0:
-            return rx.toast.error("Amount must be greater than zero.")
-        if not self.form_date:
-            return rx.toast.error("Please pick a date.")
-
-        payload = {
-            "title": title,
-            "amount": round(amount, 2),
-            "category": self.form_category,
-            "date": self.form_date,
-            "note": self.form_note.strip(),
-        }
-        try:
-            if self.editing_id:
-                update_expense(self.editing_id, payload)
-            else:
-                create_expense(payload)
-            self.expenses = fetch_expenses()
-        except Exception as exc:  # noqa: BLE001
-            return rx.toast.error(f"Could not save: {exc}")
-
-        self.show_form = False
-        return rx.toast.success("Expense saved.")
-
-    # ---- delete ------------------------------------------------------------ #
-    def delete_expense(self, expense_id: str):
-        try:
-            remove_expense(expense_id)
-            self.expenses = [e for e in self.expenses if e["id"] != expense_id]
-        except Exception as exc:  # noqa: BLE001
-            return rx.toast.error(f"Could not delete: {exc}")
-        return rx.toast.success("Expense deleted.")
-
-    # ---- AI: smart add ----------------------------------------------------- #
-    def smart_add(self):
-        text = self.smart_text.strip()
-        if not text:
-            yield rx.toast.warning("Type something like 'Lunch 450 yesterday'.")
-            return
-        self.ai_loading = True
-        yield
-        try:
-            parsed = parse_expense_with_gemini(text)
-        except Exception as exc:  # noqa: BLE001
-            self.ai_loading = False
-            yield rx.toast.error(f"Gemini could not parse that: {exc}")
-            return
-
-        # Pre-fill the form so you can review before saving.
-        self.editing_id = ""
-        self.form_title = str(parsed.get("title", ""))
-        self.form_amount = str(parsed.get("amount", ""))
-        self.form_category = parsed.get("category", "Other")
-        self.form_date = str(parsed.get("date") or date.today().isoformat())
-        self.form_note = str(parsed.get("note", ""))
-        self.smart_text = ""
-        self.ai_loading = False
-        self.show_form = True
-
-    # ---- AI: insights ------------------------------------------------------ #
-    def get_insights(self):
-        if not self.expenses:
-            yield rx.toast.info("Add a few expenses first.")
-            return
-        self.ai_loading = True
-        yield
-        try:
-            self.insights = generate_spending_insights(self.expenses)
-        except Exception as exc:  # noqa: BLE001
-            yield rx.toast.error(f"Gemini error: {exc}")
-        finally:
-            self.ai_loading = False
-
-
-# --------------------------------------------------------------------------- #
-# UI components
-# --------------------------------------------------------------------------- #
-def expense_row(e: dict) -> rx.Component:
-    return rx.table.row(
-        rx.table.cell(e["date"]),
-        rx.table.cell(
-            rx.vstack(
-                rx.text(e["title"], weight="medium"),
-                rx.cond(
-                    e["note"] != "",
-                    rx.text(e["note"], size="1", color_scheme="gray"),
-                ),
-                spacing="0",
-            )
-        ),
-        rx.table.cell(rx.badge(e["category"])),
-        rx.table.cell(rx.text(CURRENCY, " ", e["amount"], weight="bold")),
-        rx.table.cell(
-            rx.hstack(
-                rx.icon_button(
-                    "pencil",
-                    variant="soft",
-                    on_click=State.open_edit(e["id"]),
-                ),
-                rx.alert_dialog.root(
-                    rx.alert_dialog.trigger(
-                        rx.icon_button("trash-2", variant="soft", color_scheme="red")
-                    ),
-                    rx.alert_dialog.content(
-                        rx.alert_dialog.title("Delete expense?"),
-                        rx.alert_dialog.description("This can't be undone."),
-                        rx.flex(
-                            rx.alert_dialog.cancel(
-                                rx.button("Cancel", variant="soft", color_scheme="gray")
-                            ),
-                            rx.alert_dialog.action(
-                                rx.button(
-                                    "Delete",
-                                    color_scheme="red",
-                                    on_click=State.delete_expense(e["id"]),
-                                )
-                            ),
-                            spacing="3",
-                            justify="end",
-                            margin_top="16px",
-                        ),
-                    ),
-                ),
-                spacing="2",
-            )
-        ),
+    title = st.text_input("Title", value=e.get("title", ""), placeholder="Groceries")
+    amount = st.number_input(
+        f"Amount ({CURRENCY})",
+        min_value=0.0,
+        step=1.0,
+        format="%.2f",
+        value=float(e.get("amount", 0.0)),
     )
-
-
-def expense_form() -> rx.Component:
-    return rx.dialog.root(
-        rx.dialog.content(
-            rx.dialog.title(
-                rx.cond(State.editing_id != "", "Edit expense", "Add expense")
-            ),
-            rx.vstack(
-                rx.input(
-                    placeholder="Title (e.g. Groceries)",
-                    value=State.form_title,
-                    on_change=lambda v: State.set_field("form_title", v),
-                    width="100%",
-                ),
-                rx.input(
-                    placeholder="Amount",
-                    type="number",
-                    value=State.form_amount,
-                    on_change=lambda v: State.set_field("form_amount", v),
-                    width="100%",
-                ),
-                rx.select(
-                    CATEGORIES,
-                    value=State.form_category,
-                    on_change=lambda v: State.set_field("form_category", v),
-                    width="100%",
-                ),
-                rx.input(
-                    type="date",
-                    value=State.form_date,
-                    on_change=lambda v: State.set_field("form_date", v),
-                    width="100%",
-                ),
-                rx.text_area(
-                    placeholder="Note (optional)",
-                    value=State.form_note,
-                    on_change=lambda v: State.set_field("form_note", v),
-                    width="100%",
-                ),
-                spacing="3",
-                width="100%",
-            ),
-            rx.flex(
-                rx.dialog.close(
-                    rx.button("Cancel", variant="soft", color_scheme="gray")
-                ),
-                rx.button("Save", on_click=State.save_expense),
-                spacing="3",
-                justify="end",
-                margin_top="16px",
-            ),
-        ),
-        open=State.show_form,
-        on_open_change=State.toggle_form,
+    category = st.selectbox(
+        "Category",
+        CATEGORIES,
+        index=CATEGORIES.index(category) if category in CATEGORIES else 0,
     )
+    when = st.date_input("Date", value=e.get("date", date.today()))
+    note = st.text_area("Note (optional)", value=e.get("note", ""))
 
-
-def smart_add_card() -> rx.Component:
-    return rx.card(
-        rx.vstack(
-            rx.hstack(
-                rx.icon("sparkles", size=18),
-                rx.text("Smart add (Gemini)", weight="bold"),
-                align="center",
-            ),
-            rx.hstack(
-                rx.input(
-                    placeholder="e.g. Lunch at the cafe 450 yesterday",
-                    value=State.smart_text,
-                    on_change=lambda v: State.set_field("smart_text", v),
-                    width="100%",
-                ),
-                rx.button(
-                    "Fill form",
-                    on_click=State.smart_add,
-                    loading=State.ai_loading,
-                ),
-                width="100%",
-            ),
-            spacing="3",
-            width="100%",
-        ),
-        width="100%",
-    )
-
-
-def summary_card() -> rx.Component:
-    return rx.card(
-        rx.vstack(
-            rx.hstack(
-                rx.vstack(
-                    rx.text("Total (current view)", size="2", color_scheme="gray"),
-                    rx.heading(CURRENCY, " ", State.total_spent, size="7"),
-                    spacing="1",
-                ),
-                rx.spacer(),
-                rx.select(
-                    ["All", *CATEGORIES],
-                    value=State.filter_category,
-                    on_change=lambda v: State.set_field("filter_category", v),
-                ),
-                width="100%",
-                align="center",
-            ),
-            rx.flex(
-                rx.foreach(
-                    State.category_totals,
-                    lambda c: rx.badge(
-                        c["category"], ": ", c["amount"], variant="soft", size="2"
-                    ),
-                ),
-                wrap="wrap",
-                spacing="2",
-            ),
-            spacing="3",
-            width="100%",
-        ),
-        width="100%",
-    )
-
-
-def expense_table() -> rx.Component:
-    return rx.cond(
-        State.visible_expenses.length() > 0,
-        rx.table.root(
-            rx.table.header(
-                rx.table.row(
-                    rx.table.column_header_cell("Date"),
-                    rx.table.column_header_cell("Title"),
-                    rx.table.column_header_cell("Category"),
-                    rx.table.column_header_cell("Amount"),
-                    rx.table.column_header_cell("Actions"),
+    if st.button("Save", type="primary"):
+        if not title.strip():
+            st.error("Please enter a title.")
+        elif amount <= 0:
+            st.error("Amount must be greater than zero.")
+        else:
+            try:
+                save_expense(
+                    e.get("id"),
+                    {
+                        "title": title.strip(),
+                        "amount": round(float(amount), 2),
+                        "category": category,
+                        "date": when.isoformat(),
+                        "note": note.strip(),
+                    },
                 )
-            ),
-            rx.table.body(rx.foreach(State.visible_expenses, expense_row)),
-            width="100%",
-        ),
-        rx.center(
-            rx.text("No expenses yet. Click “Add expense” to get started."),
-            padding="32px",
-            width="100%",
-        ),
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not save: {exc}")
+            else:
+                st.toast("Expense saved.", icon="✅")
+                st.rerun()
+
+
+@st.dialog("Delete expense?")
+def delete_dialog(expense: dict) -> None:
+    st.write(
+        f"**{expense['title']}** - {CURRENCY} {expense['amount']:,.2f} "
+        f"on {expense['date']}"
+    )
+    st.caption("This can't be undone.")
+    left, right = st.columns(2)
+    if left.button("Delete", type="primary"):
+        try:
+            remove_expense(expense["id"])
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not delete: {exc}")
+        else:
+            st.toast("Expense deleted.", icon="🗑️")
+            st.rerun()
+    if right.button("Cancel"):
+        st.rerun()
+
+
+# --------------------------------------------------------------------------- #
+# Page
+# --------------------------------------------------------------------------- #
+require_password()
+
+st.title("💸 Expense Tracker")
+
+try:
+    expenses = load_expenses()
+except Exception as exc:  # noqa: BLE001
+    st.error(f"Could not connect to Firebase: {exc}")
+    st.info("Check the `[firebase]` section of your Streamlit secrets (see README).")
+    st.stop()
+
+# ---- Smart add (Gemini) ---------------------------------------------------- #
+with st.form("smart_add", clear_on_submit=True):
+    smart_text = st.text_input(
+        "✨ Smart add (Gemini)",
+        placeholder="e.g. Lunch at the cafe 450 yesterday",
+    )
+    smart_submitted = st.form_submit_button("Fill form")
+
+if smart_submitted and smart_text.strip():
+    try:
+        with st.spinner("Asking Gemini..."):
+            parsed = parse_expense_with_gemini(smart_text.strip())
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Gemini could not parse that: {exc}")
+    else:
+        expense_dialog(parsed)  # pre-filled so you can review before saving
+
+# ---- Summary --------------------------------------------------------------- #
+top_left, top_right = st.columns([3, 1])
+with top_right:
+    if st.button("➕ Add expense", type="primary"):
+        expense_dialog()
+
+with top_left:
+    chosen = st.selectbox("Filter by category", ["All", *CATEGORIES])
+
+visible = expenses if chosen == "All" else [e for e in expenses if e["category"] == chosen]
+today = date.today()
+month_total = sum(
+    e["amount"]
+    for e in visible
+    if e["date"].year == today.year and e["date"].month == today.month
+)
+
+m1, m2, m3 = st.columns(3)
+m1.metric(f"Total ({CURRENCY})", f"{sum(e['amount'] for e in visible):,.2f}")
+m2.metric("This month", f"{month_total:,.2f}")
+m3.metric("Expenses", len(visible))
+
+if expenses:
+    by_category = (
+        pd.DataFrame(expenses).groupby("category")["amount"].sum().sort_values(ascending=False)
+    )
+    st.bar_chart(by_category)
+
+# ---- Table with edit / delete ---------------------------------------------- #
+st.subheader("Expenses")
+if visible:
+    amount_label = f"Amount ({CURRENCY})"
+    table = pd.DataFrame(
+        [
+            {
+                "Date": e["date"],
+                "Title": e["title"],
+                "Category": e["category"],
+                amount_label: e["amount"],
+                "Note": e["note"],
+            }
+            for e in visible
+        ]
+    )
+    event = st.dataframe(
+        table,
+        hide_index=True,
+        width="stretch",
+        on_select="rerun",
+        selection_mode="single-row",
+        column_config={amount_label: st.column_config.NumberColumn(format="%.2f")},
     )
 
+    selected_rows = event.selection.rows
+    if selected_rows:
+        selected = visible[selected_rows[0]]
+        edit_col, delete_col, _ = st.columns([1, 1, 4])
+        if edit_col.button("✏️ Edit selected"):
+            expense_dialog(selected)
+        if delete_col.button("🗑️ Delete selected"):
+            delete_dialog(selected)
+    else:
+        st.caption("Select a row to edit or delete it.")
+else:
+    st.info("No expenses yet. Click **Add expense** to get started.")
 
-def insights_card() -> rx.Component:
-    return rx.card(
-        rx.vstack(
-            rx.hstack(
-                rx.icon("brain", size=18),
-                rx.text("AI insights", weight="bold"),
-                rx.spacer(),
-                rx.button(
-                    "Analyse my spending",
-                    variant="soft",
-                    on_click=State.get_insights,
-                    loading=State.ai_loading,
-                ),
-                width="100%",
-                align="center",
-            ),
-            rx.cond(State.insights != "", rx.markdown(State.insights)),
-            spacing="3",
-            width="100%",
-        ),
-        width="100%",
-    )
+# ---- AI insights ----------------------------------------------------------- #
+st.subheader("AI insights")
+if st.button("Analyse my spending"):
+    if not expenses:
+        st.info("Add a few expenses first.")
+    else:
+        try:
+            with st.spinner("Asking Gemini..."):
+                st.session_state["insights"] = generate_spending_insights(expenses)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Gemini error: {exc}")
 
-
-def index() -> rx.Component:
-    return rx.container(
-        rx.vstack(
-            rx.hstack(
-                rx.heading("Expense Tracker", size="8"),
-                rx.spacer(),
-                rx.color_mode.button(),
-                rx.button(rx.icon("plus"), "Add expense", on_click=State.open_add),
-                width="100%",
-                align="center",
-            ),
-            smart_add_card(),
-            summary_card(),
-            rx.cond(State.loading, rx.center(rx.spinner(), width="100%")),
-            expense_table(),
-            insights_card(),
-            expense_form(),
-            spacing="5",
-            width="100%",
-            padding_y="24px",
-        ),
-        size="3",
-    )
-
-
-app = rx.App(theme=rx.theme(accent_color="indigo", radius="large"))
-app.add_page(index, title="Expense Tracker", on_load=State.load_expenses)
+if st.session_state.get("insights"):
+    st.markdown(st.session_state["insights"])
