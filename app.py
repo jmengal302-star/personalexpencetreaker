@@ -74,20 +74,90 @@ def require_password() -> None:
 # --------------------------------------------------------------------------- #
 # Firebase (Firestore) data layer
 # --------------------------------------------------------------------------- #
+_SA_KEYS = (
+    "type",
+    "project_id",
+    "private_key_id",
+    "private_key",
+    "client_email",
+    "client_id",
+    "auth_uri",
+    "token_uri",
+    "auth_provider_x509_cert_url",
+    "client_x509_cert_url",
+    "universe_domain",
+)
+_SA_REQUIRED = ("project_id", "private_key", "client_email")
+
+
+def _secrets_status() -> tuple[list[str], str | None]:
+    """Return (secret key names, error message if secrets can't be read)."""
+    try:
+        return list(st.secrets.keys()), None
+    except Exception as exc:  # noqa: BLE001
+        return [], f"{type(exc).__name__}: {exc}"
+
+
+def _find_service_account() -> dict | str:
+    """Locate Firebase credentials. Returns a dict (from secrets) or a file path.
+
+    Supported, in order:
+      1. FIREBASE_JSON  = '''<entire service-account JSON>'''   (easiest)
+      2. [firebase] table with the JSON fields as TOML keys
+      3. the JSON fields pasted at the top level of the secrets
+      4. a local key file (FIREBASE_CREDENTIALS, default serviceAccountKey.json)
+    """
+    for key in ("FIREBASE_JSON", "firebase", "FIREBASE_SERVICE_ACCOUNT"):
+        raw = _secret(key)
+        if not raw:
+            continue
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"`{key}` is set but is not valid JSON: {exc}") from exc
+        return dict(raw)
+
+    if _secret("private_key") and _secret("client_email"):
+        return {k: _secret(k) for k in _SA_KEYS if _secret(k) is not None}
+
+    path = str(_secret("FIREBASE_CREDENTIALS", "serviceAccountKey.json"))
+    if os.path.exists(path):
+        return path
+
+    names, error = _secrets_status()
+    detail = (
+        f"Streamlit could not read your secrets ({error})."
+        if error
+        else f"Your secrets currently contain these keys: {names or 'none'}."
+    )
+    raise RuntimeError(
+        "No Firebase credentials found. "
+        + detail
+        + " Add FIREBASE_JSON (or a [firebase] table) to your secrets, "
+        "save, and reboot the app. See README step 3."
+    )
+
+
 @st.cache_resource
 def get_db():
     """Initialise Firebase once and return the Firestore client."""
     try:
         firebase_admin.get_app()
     except ValueError:
-        info = _secret("firebase")
-        if info:
-            cred = credentials.Certificate(dict(info))
-        else:
-            cred = credentials.Certificate(
-                _secret("FIREBASE_CREDENTIALS", "serviceAccountKey.json")
-            )
-        firebase_admin.initialize_app(cred)
+        source = _find_service_account()
+        if isinstance(source, dict):
+            missing = [k for k in _SA_REQUIRED if not source.get(k)]
+            if missing:
+                raise RuntimeError(
+                    f"Firebase credentials are missing: {', '.join(missing)}."
+                ) from None
+            # Fix keys whose newlines were pasted as literal "\n" text.
+            source = {
+                **source,
+                "private_key": str(source["private_key"]).replace("\\n", "\n"),
+            }
+        firebase_admin.initialize_app(credentials.Certificate(source))
     return firestore.client()
 
 
@@ -281,7 +351,7 @@ try:
     expenses = load_expenses()
 except Exception as exc:  # noqa: BLE001
     st.error(f"Could not connect to Firebase: {exc}")
-    st.info("Check the `[firebase]` section of your Streamlit secrets (see README).")
+    st.info("Fix your Firebase credentials in the Streamlit secrets (README, step 3).")
     st.stop()
 
 # ---- Smart add (Gemini) ---------------------------------------------------- #
